@@ -1,18 +1,12 @@
 from __future__ import annotations
-import os
 import random
 import math
 import pygame
 import sys
 import time
-import pickle
-import hashlib
-import json
-from pathlib import Path
+
 from enum import Enum, auto
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
-
 """
 Project: VX World
 
@@ -30,21 +24,21 @@ Features:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-SEED        = random.randint(0,1024)
-MAP_W       = 16
-MAP_H       = 16
-MAX_HEIGHT  = 6
+SEED        = random.randint(2,2048)
+MAP_W       = 24
+MAP_H       = 24
+MAX_HEIGHT  = 8
 HIGH_ALT    = 5
 LOW_ALT     = 1
 MAX_SLOPE   = 1
 
-WORLD_PEAKS = 2
-WORLD_SPREAD = 7.0
+WORLD_PEAKS = 1
+WORLD_SPREAD = 8.0
 
 # Base sprite dimensions (should never change)
-TILE_W_BASE = 64
-TILE_H_BASE = 64
-TILE_Z_BASE = 32
+TILE_W_BASE = 128
+TILE_H_BASE = 128
+TILE_Z_BASE = 64
 
 # Scale factors
 SCALE        = 0.5
@@ -66,9 +60,9 @@ ROCK       = "ROCK"
 # ── Texture Engine config ─────────────────────────────────────────────────────
 
 # Native resolution the collapse runs at — scaled up with nearest-neighbor on blit.
-# Smaller = chunkier pixels, faster collapse. 12 is a good GB-feel sweet spot.
+# smaller = chunkier pixels, faster collapse. 12 is a good GB-feel sweet spot.
 TEX_NATIVE_W = 12
-TEX_NATIVE_H = 12
+TEX_NATIVE_H = 8
 
 # 4-color palette — index 0=darkest shadow, 3=lightest catch-light
 PALETTE: list[tuple[int,int,int]] = [
@@ -85,7 +79,7 @@ FACE_RIGHT_IDX = 0   # darkest face
 
 # ── Inspection Mode config ────────────────────────────────────────────────────
 
-GHOST_OVERLAY_ALPHA  = 170
+GHOST_OVERLAY_ALPHA  = 70
 GHOST_SUBBLOCK_ALPHA = 140
 SELECT_COLOR         = (255, 220, 50)
 SELECT_WIDTH         = 2
@@ -269,362 +263,250 @@ MATERIALS: dict[str, MaterialDef] = {
 
 }
 
-class TextureCache:
-    """
-    Manages disk caching for procedurally generated textures.
-    Creates cache keys based on material definitions + seed.
-    """
-    
-    def __init__(self, cache_dir: str = "cache/textures"):
-        self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Store material signatures for change detection
-        self.signatures_file = self.cache_dir / "material_signatures.json"
-        self.signatures = self._load_signatures()
-    
-    def _load_signatures(self) -> Dict[str, str]:
-        """Load previously stored material signatures"""
-        if self.signatures_file.exists():
-            try:
-                with open(self.signatures_file, 'r') as f:
-                    return json.load(f)
-            except:
-                return {}
-        return {}
-    
-    def _save_signatures(self) -> None:
-        """Save current material signatures"""
-        with open(self.signatures_file, 'w') as f:
-            json.dump(self.signatures, f, indent=2)
-    
-    def _compute_material_signature(self, material_name: str) -> str:
-        """Create unique hash for a material's definition"""
-        mat = MATERIALS[material_name]
-        # Include all parameters that affect visual output
-        data = f"{material_name}{mat.bias}{mat.coherence}{mat.run_pref}{mat.seed_offset}"
-        return hashlib.md5(data.encode()).hexdigest()[:16]
-    
-    def _compute_global_signature(self, seed: int) -> str:
-        """Create signature for all materials + seed"""
-        hash_input = f"{seed}"
-        for name in MATERIALS:
-            hash_input += self._compute_material_signature(name)
-        return hashlib.md5(hash_input.encode()).hexdigest()
-    
-    def has_changed(self, seed: int) -> bool:
-        """Check if any material definitions have changed since last cache"""
-        current_sigs = {}
-        for name in MATERIALS:
-            current_sigs[name] = self._compute_material_signature(name)
-        
-        # Compare with stored signatures
-        if current_sigs != self.signatures:
-            return True
-        
-        # Also check if it's a new seed
-        cache_key = self._compute_global_signature(seed)
-        return not (self.cache_dir / f"manifest_{cache_key}.json").exists()
-    
-    def update_signatures(self) -> None:
-        """Update stored signatures to match current materials"""
-        for name in MATERIALS:
-            self.signatures[name] = self._compute_material_signature(name)
-        self._save_signatures()
-    
-    def get_native_path(self, material: str, seed: int) -> Path:
-        """Path for cached native surface (pre-scaled)"""
-        sig = self._compute_global_signature(seed)
-        return self.cache_dir / f"native_{material}_{sig}.png"
-    
-    def get_scaled_path(self, material: str, scale_key: int, seed: int) -> Path:
-        """Path for cached scaled surface"""
-        sig = self._compute_global_signature(seed)
-        return self.cache_dir / f"scaled_{material}_{scale_key}_{sig}.png"
-    
-    def get_grid_path(self, material: str, seed: int) -> Path:
-        """Path for cached raw grid data (palette indices)"""
-        sig = self._compute_global_signature(seed)
-        return self.cache_dir / f"grid_{material}_{sig}.pkl"
-    
-    def save_manifest(self, seed: int, metadata: Dict[str, Any]) -> None:
-        """Save manifest with generation metadata"""
-        sig = self._compute_global_signature(seed)
-        manifest_path = self.cache_dir / f"manifest_{sig}.json"
-        
-        metadata.update({
-            "seed": seed,
-            "timestamp": time.time(),
-            "material_signatures": self.signatures.copy()
-        })
-        
-        with open(manifest_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-    
-    def load_manifest(self, seed: int) -> Optional[Dict[str, Any]]:
-        """Load manifest if it exists"""
-        sig = self._compute_global_signature(seed)
-        manifest_path = self.cache_dir / f"manifest_{sig}.json"
-        
-        if manifest_path.exists():
-            with open(manifest_path, 'r') as f:
-                return json.load(f)
-        return None
-    
-    def clear_all(self) -> None:
-        """Delete all cache files"""
-        import shutil
-        shutil.rmtree(self.cache_dir)
-        self.cache_dir.mkdir(parents=True)
-        self.signatures = {}
-        print("Cache cleared")
-
-
 class TextureEngine:
     """
-    Procedural texture generator with intelligent disk caching.
+    Procedural tile generator using a single-pass collapse function.
+
+    Two-tier cache — designed around the dirty-flag model:
+
+      Tier 1  _tex_cache  : block_type → raw pixel grid (palette indices)
+                            Built once at load(). Invalidated only on world
+                            state change (decay, mutation) via invalidate().
+
+      Tier 2  _surf_cache : (block_type, scale_key) → pygame.Surface
+                            Pre-baked for ALL discrete zoom levels at load()
+                            so runtime zoom is a pure dict lookup — zero cost.
+
+    Public interface identical to old SpriteCache so Renderer is untouched.
     """
-    
-    def __init__(self, seed: int = SEED, enable_cache: bool = True):
-        self._seed = seed
-        self._enable_cache = enable_cache
-        
-        if enable_cache:
-            self.cache = TextureCache()
-        else:
-            self.cache = None
-        
-        # Rest of your existing init
-        self._tex_cache: dict[str, list[list[int]]] = {}
-        self._native_surfaces: dict[str, pygame.Surface] = {}
+
+    def __init__(self, seed: int = SEED) -> None:
+        self._seed       = seed
+        self._tex_cache:  dict[str, list[list[int]]]            = {}
         self._surf_cache: dict[tuple[str, int], pygame.Surface] = {}
         self._current_scale: float = 0.0
-        self._scaled_dict: dict[str, pygame.Surface] = {}
-        
-        # Pre-compute zoom levels
+        self._scaled_dict:   dict[str, pygame.Surface]          = {}
+
+        # Pre-compute every discrete zoom level that the camera can reach.
+        # SCALE_STEP increments from SCALE_MIN to SCALE_MAX → 16 levels.
+        # Stored as integer keys (scale * 1000) to avoid float drift.
         self._zoom_levels: list[int] = []
         s = SCALE_MIN
         while s <= SCALE_MAX + 0.001:
             self._zoom_levels.append(round(s * 1000))
             s = round(s + SCALE_STEP, 4)
-        
-        # Pre-compute pygame colors
-        self._pygame_palette = [pygame.Color(*c) for c in PALETTE]
-    
-    def load(self, force_regen: bool = False) -> None:
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def load(self) -> None:
         """
-        Load textures with intelligent caching.
-        Set force_regen=True to ignore cache and regenerate everything.
+        Full startup bake — runs once.
+        Phase 1: collapse all materials into pixel grids  (trivial, ~2ms)
+        Phase 2: build pygame Surfaces at every zoom level (~60ms typical)
+        After this returns, all runtime paths are pure cache lookups.
         """
-        n_mat = len(MATERIALS)
-        n_zoom = len(self._zoom_levels)
+        n_mat   = len(MATERIALS)
+        n_zoom  = len(self._zoom_levels)
+        total   = n_mat + n_mat * n_zoom
         
-        print(f'\nTextureEngine v2 loading...')
-        print(f'    Materials   = {n_mat}')
-        print(f'    Zoom levels = {n_zoom}')
-        print(f'    Seed        = {self._seed}')
+        print(f'Generating textures...')
+        print(f'    Materials   = {n_mat} [depth={n_zoom}]')
+        print(f'    Surfaces    = {n_mat * n_zoom}')
         
-        # Check if we need to regenerate
-        needs_regen = force_regen
-        if self._enable_cache and not needs_regen:
-            needs_regen = self.cache.has_changed(self._seed)
-            if not needs_regen:
-                manifest = self.cache.load_manifest(self._seed)
-                if manifest:
-                    print(f'    Cache valid  = yes (from {time.ctime(manifest["timestamp"])})')
-                else:
-                    needs_regen = True
-        
-        if needs_regen:
-            print(f'    Cache valid  = no - generating new textures')
-            self._generate_all()
-            if self._enable_cache:
-                self._save_to_cache()
-        else:
-            print(f'    Cache valid  = yes - loading from disk')
-            self._load_from_cache()
-        
-        # Prime the active dict
-        self._activate_scale(SCALE)
-        print(f'    Ready\n')
-    
-    def _generate_all(self) -> None:
-        """Generate all textures from scratch"""
         t_start = time.perf_counter()
-        
-        # Step 1: Generate native grids and surfaces
-        print(f'    Generating native textures...')
+
+        # ── Phase 1: collapse ─────────────────────────────────────────────
         for bt in MATERIALS:
-            grid = self._collapse(bt)
-            self._tex_cache[bt] = grid
-            self._native_surfaces[bt] = self._grid_to_surface(grid)
-        
-        # Step 2: Pre-create masks for each zoom level
-        masks = {}
+            self._tex_cache[bt] = self._collapse(bt)
+
+        # ── Phase 2: bake all zoom levels ─────────────────────────────────
         for scale_key in self._zoom_levels:
             scale = scale_key / 1000.0
-            tw = max(2, int(TILE_W_BASE * scale))
-            th = max(2, int(TILE_H_BASE * scale))
-            masks[scale_key] = self._make_diamond_mask(tw, th)
-        
-        # Step 3: Build all scaled surfaces
-        print(f'    Building {n_mat * len(self._zoom_levels)} scaled surfaces...')
-        for scale_key in self._zoom_levels:
-            scale = scale_key / 1000.0
-            tw = max(2, int(TILE_W_BASE * scale))
-            th = max(2, int(TILE_H_BASE * scale))
-            tz = max(1, int(TILE_Z_BASE * scale))
-            qh = max(1, th // 4)
-            hw = tw // 2
-            
-            mask = masks[scale_key]
-            
+            tw    = max(2, int(TILE_W_BASE * scale))
+            th    = max(2, int(TILE_H_BASE * scale))
+            # Build shared diamond mask for this size (reused across materials)
+            mask  = self._make_diamond_mask(tw, th)
             for bt in MATERIALS:
-                native = self._native_surfaces[bt]
-                tex = pygame.transform.scale(native, (tw, qh * 2))
-                
-                surf = self._build_tile_surface_fast(
-                    tex, mask, tw, th, qh, hw, tz
+                surf = self._build_tile_surface(
+                    self._tex_cache[bt], tw, th, mask
                 )
                 self._surf_cache[(bt, scale_key)] = surf
-        
+
         elapsed = (time.perf_counter() - t_start) * 1000
-        print(f'    Generated in {elapsed:.0f}ms')
-    
-    def _save_to_cache(self) -> None:
-        """Save all generated textures to disk cache"""
-        if not self._enable_cache:
-            return
-        
-        print(f'    Saving to cache...')
-        t_start = time.perf_counter()
-        
-        # Save native surfaces
-        for bt, surf in self._native_surfaces.items():
-            path = self.cache.get_native_path(bt, self._seed)
-            pygame.image.save(surf, str(path))
-        
-        # Save raw grids (useful for debugging)
-        for bt, grid in self._tex_cache.items():
-            path = self.cache.get_grid_path(bt, self._seed)
-            with open(path, 'wb') as f:
-                pickle.dump(grid, f)
-        
-        # Save scaled surfaces
-        saved_count = 0
-        for (bt, scale_key), surf in self._surf_cache.items():
-            path = self.cache.get_scaled_path(bt, scale_key, self._seed)
-            pygame.image.save(surf, str(path))
-            saved_count += 1
-        
-        # Save manifest
-        self.cache.update_signatures()
-        self.cache.save_manifest(self._seed, {
-            "surfaces_saved": saved_count,
-            "native_size": TEX_NATIVE_W,
-        })
-        
-        elapsed = (time.perf_counter() - t_start) * 1000
-        print(f'    Saved {saved_count} files in {elapsed:.0f}ms')
-    
-    def _load_from_cache(self) -> None:
-        """Load all textures from disk cache"""
-        if not self._enable_cache:
-            raise RuntimeError("Cache disabled but _load_from_cache called")
-        
-        t_start = time.perf_counter()
-        
-        # Load native surfaces
-        for bt in MATERIALS:
-            path = self.cache.get_native_path(bt, self._seed)
-            if path.exists():
-                self._native_surfaces[bt] = pygame.image.load(str(path))
-        
-        # Load raw grids (optional)
-        for bt in MATERIALS:
-            path = self.cache.get_grid_path(bt, self._seed)
-            if path.exists():
-                with open(path, 'rb') as f:
-                    self._tex_cache[bt] = pickle.load(f)
-        
-        # Load scaled surfaces
-        loaded_count = 0
-        for bt in MATERIALS:
-            for scale_key in self._zoom_levels:
-                path = self.cache.get_scaled_path(bt, scale_key, self._seed)
-                if path.exists():
-                    surf = pygame.image.load(str(path))
-                    self._surf_cache[(bt, scale_key)] = surf
-                    loaded_count += 1
-        
-        elapsed = (time.perf_counter() - t_start) * 1000
-        print(f'    Loaded {loaded_count} files in {elapsed:.0f}ms')
-    
-    def invalidate(self, block_type: str = None) -> None:
+        print(f'  baked {len(self._surf_cache)} surfaces in {elapsed:.0f}ms\n')
+
+        # Prime the active dict for the default scale
+        self._activate_scale(SCALE)
+
+    def get(self, scale: float) -> dict[str, pygame.Surface]:
+        """Runtime zoom — O(1) dict lookup, no surface construction."""
+        if abs(scale - self._current_scale) > 0.001:
+            self._activate_scale(scale)
+        return self._scaled_dict
+
+    def invalidate(self, block_type: str) -> None:
         """
-        Force regeneration for one material or all.
-        Useful when tweaking MATERIALS during development.
+        Force re-collapse + re-bake for one material.
+        Called by the decay system when a block type mutates.
+        Rebuilds all zoom levels for that material, then re-activates
+        the current scale so the next frame picks up the change.
         """
-        if self._enable_cache:
-            if block_type:
-                # Clear specific material
-                for path in self.cache.cache_dir.glob(f"*_{block_type}_*"):
-                    path.unlink()
-                print(f"Cache invalidated for {block_type}")
-            else:
-                # Clear everything
-                self.cache.clear_all()
-    
-    # Your existing helper methods (_collapse, _grid_to_surface, etc.)
-    # ... with optimizations from previous message
-    
-    def _grid_to_surface(self, grid: list[list[int]]) -> pygame.Surface:
-        """Convert grid to surface efficiently"""
-        surf = pygame.Surface((TEX_NATIVE_W, TEX_NATIVE_H))
-        for y in range(TEX_NATIVE_H):
-            for x in range(TEX_NATIVE_W):
-                color_idx = grid[y][x]
-                surf.set_at((x, y), self._pygame_palette[color_idx])
-        return surf
-    
-    def _build_tile_surface_fast(self, tex: pygame.Surface, mask: pygame.Surface,
-                                 tw: int, th: int, qh: int, hw: int, tz: int) -> pygame.Surface:
-        """Optimized version of your surface builder"""
-        surf = pygame.Surface((tw, th), pygame.SRCALPHA)
-        
-        # Top face
-        temp = pygame.Surface((tw, th), pygame.SRCALPHA)
-        temp.blit(tex, (0, 0))
-        temp.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
-        surf.blit(temp, (0, 0))
-        
-        # Left face
-        left_color = (*PALETTE[FACE_LEFT_IDX], 255)
-        pygame.draw.polygon(surf, left_color, [
-            (0, qh), (hw, qh * 2),
-            (hw, qh*2 + tz), (0, qh + tz)
-        ])
-        
-        # Right face
-        right_color = (*PALETTE[FACE_RIGHT_IDX], 255)
-        pygame.draw.polygon(surf, right_color, [
-            (hw, qh * 2), (tw - 1, qh),
-            (tw - 1, qh + tz), (hw, qh*2 + tz)
-        ])
-        
-        return surf
-    
+        print(f'TextureEngine.invalidate({block_type})')
+        self._tex_cache[block_type] = self._collapse(block_type)
+
+        for scale_key in self._zoom_levels:
+            scale = scale_key / 1000.0
+            tw    = max(2, int(TILE_W_BASE * scale))
+            th    = max(2, int(TILE_H_BASE * scale))
+            mask  = self._make_diamond_mask(tw, th)
+            surf  = self._build_tile_surface(
+                self._tex_cache[block_type], tw, th, mask
+            )
+            self._surf_cache[(block_type, scale_key)] = surf
+
+        self._activate_scale(self._current_scale)
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _activate_scale(self, scale: float) -> None:
+        """Swap the active surface dict to the requested zoom level."""
+        scale_key = round(scale * 1000)
+        # Snap to nearest known key (handles floating-point edge cases)
+        if scale_key not in [k for _, k in self._surf_cache]:
+            scale_key = min(self._zoom_levels, key=lambda k: abs(k - scale_key))
+        self._scaled_dict   = {
+            bt: self._surf_cache[(bt, scale_key)]
+            for bt in MATERIALS
+            if (bt, scale_key) in self._surf_cache
+        }
+        self._current_scale = scale
+
+    # ── Collapse function ─────────────────────────────────────────────────────
+
+    def _collapse(self, block_type: str) -> list[list[int]]:
+        """
+        Single-pass collapse over a TEX_NATIVE_W × TEX_NATIVE_H grid.
+
+        Sweeps left-to-right, top-to-bottom. At each cell:
+          1. Start from material bias distribution.
+          2. Left + top neighbours propagate constraint (scaled by coherence).
+          3. Run preference boosts continuation of same colour along a row.
+          4. Sample from the final weighted distribution.
+
+        One pass only — no iteration. Character comes entirely from MaterialDef.
+        """
+        mat  = MATERIALS[block_type]
+        rng  = random.Random(self._seed ^ mat.seed_offset)
+        W, H = TEX_NATIVE_W, TEX_NATIVE_H
+        n    = len(PALETTE)
+
+        total        = sum(mat.bias)
+        base_weights = [b / total for b in mat.bias]
+        grid: list[list[int]] = [[0] * W for _ in range(H)]
+
+        for row in range(H):
+            prev_col = -1
+            for col in range(W):
+                weights = list(base_weights)
+
+                if col > 0:
+                    li = grid[row][col - 1]
+                    for i in range(n):
+                        pull = mat.coherence if i == li else -mat.coherence / (n - 1)
+                        weights[i] = max(0.0, weights[i] + pull * weights[i])
+
+                if row > 0:
+                    ti = grid[row - 1][col]
+                    for i in range(n):
+                        pull = mat.coherence if i == ti else -mat.coherence / (n - 1)
+                        weights[i] = max(0.0, weights[i] + pull * weights[i])
+
+                if prev_col >= 0:
+                    weights[prev_col] = max(
+                        0.0, weights[prev_col] + mat.run_pref * weights[prev_col]
+                    )
+
+                wsum    = sum(weights) or 1.0
+                weights = [w / wsum for w in weights]
+                r       = rng.random()
+                cum     = 0.0
+                chosen  = 0
+                for i, w in enumerate(weights):
+                    cum += w
+                    if r <= cum:
+                        chosen = i
+                        break
+
+                grid[row][col] = chosen
+                prev_col = chosen
+
+        return grid
+
+    # ── Surface builders ──────────────────────────────────────────────────────
+
     @staticmethod
     def _make_diamond_mask(tw: int, th: int) -> pygame.Surface:
-        """White diamond on transparent background"""
-        hw = tw // 2
-        qh = max(1, th // 4)
+        """
+        White diamond on transparent background — shared across all materials
+        at the same tile size to avoid redundant surface allocation.
+        """
+        hw   = tw // 2
+        qh   = max(1, th // 4)
         mask = pygame.Surface((tw, th), pygame.SRCALPHA)
         mask.fill((0, 0, 0, 0))
         pygame.draw.polygon(mask, (255, 255, 255, 255), [
             (hw, 0), (tw - 1, qh), (hw, qh * 2), (0, qh)
         ])
         return mask
+
+    def _build_tile_surface(
+        self,
+        grid: list[list[int]],
+        tw: int, th: int,
+        mask: pygame.Surface,
+    ) -> pygame.Surface:
+        """
+        Composite one isometric tile surface (tw × th, SRCALPHA).
+
+        Faces:
+          Top   — collapse texture clipped to diamond via BLEND_RGBA_MULT
+          Left  — flat FACE_LEFT_IDX  colour (left parallelogram)
+          Right — flat FACE_RIGHT_IDX colour (right parallelogram)
+        """
+        hw = tw // 2
+        qh = max(1, th // 4)
+        tz = max(1, int(TILE_Z_BASE * (tw / TILE_W_BASE)))
+
+        # ── Top face ──────────────────────────────────────────────────────
+        native = pygame.Surface((TEX_NATIVE_W, TEX_NATIVE_H))
+        pxa    = pygame.PixelArray(native)
+        for row in range(TEX_NATIVE_H):
+            for col in range(TEX_NATIVE_W):
+                pxa[col, row] = native.map_rgb(*PALETTE[grid[row][col]])
+        del pxa
+
+        tex  = pygame.transform.scale(native, (tw, qh * 2))
+        temp = pygame.Surface((tw, th), pygame.SRCALPHA)
+        temp.blit(tex, (0, 0))
+        temp.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+
+        surf = pygame.Surface((tw, th), pygame.SRCALPHA)
+        surf.fill((0, 0, 0, 0))
+        surf.blit(temp, (0, 0))
+
+        # ── Left face ─────────────────────────────────────────────────────
+        pygame.draw.polygon(surf, (*PALETTE[FACE_LEFT_IDX], 255), [
+            (0,  qh),       (hw, qh * 2),
+            (hw, qh*2 + tz),(0,  qh  + tz),
+        ])
+
+        # ── Right face ────────────────────────────────────────────────────
+        pygame.draw.polygon(surf, (*PALETTE[FACE_RIGHT_IDX], 255), [
+            (hw,     qh * 2),   (tw - 1, qh),
+            (tw - 1, qh  + tz), (hw,     qh*2 + tz),
+        ])
+
+        return surf
 
 
 # ── Camera ────────────────────────────────────────────────────────────────────
@@ -1059,8 +941,7 @@ class Timeline:
 
 class Information:
     """
-    Top-center status bar.
-    Reads only from Timeline.state(),  no coupling to world or renderer
+    reads from Timeline.state()
 
     Layout:
     ┌────────────────────────────────────────────────────────────────┐
@@ -1143,6 +1024,7 @@ class Information:
 
         # Temperature
         temp_str = f"{state.base_temp:+.1f}\u00b0C"
+        
         # Cool → warm colour interpolation
         t = (state.base_temp - (AVG_TEMP - TEMP_AMP)) / (2 * TEMP_AMP)
         t = max(0.0, min(1.0, t))
@@ -1356,7 +1238,7 @@ def main() -> None:
     info     = Information(timeline, screen_w=SCREEN_W)
     info.init_fonts()
 
-    print(f'Engine ready — {TARGET_FPS}fps target')
+    print(f'Voxel engine running at {TARGET_FPS}fps')
     
     running = True
     while running:
@@ -1418,7 +1300,7 @@ def main() -> None:
         info.draw(screen)
 
         fps = clock.get_fps()
-        mode_str = "  [INSPECTION]" if renderer.inspection_mode else ""
+        mode_str = "  [INSPECTION]" if renderer.inspection_mode else "  [VIEWING]"
         pygame.display.set_caption(
             f"Voxel Engine [seed {SEED} | scale {camera.scale:.2f} | {fps:.0f} fps]{mode_str}"
         )
