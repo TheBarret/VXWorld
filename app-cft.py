@@ -10,35 +10,25 @@ from dataclasses import dataclass
 """
 Project: VX World
 
-A voxel world build for lightweight GA agents to test on.
-the world map is designed to be traversable and also adhere
-to some primitive environment factors, like time, season and thermo dynamics (decay gradients)
-
-Features:
-- Voxel Engine (done)
-- Map Generator (done)
-- Simulation Manager (simple timeline epoch for seasons and day/night cycles) * unfinished state *
-- Decay System (todo)
-
 """
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-SEED        = random.randint(2,2048)
+SEED        = 1 #random.randint(1,2048)
 MAP_W       = 24
 MAP_H       = 24
-MAX_HEIGHT  = 8
+MAX_HEIGHT  = 6
 HIGH_ALT    = 5
 LOW_ALT     = 1
 MAX_SLOPE   = 1
 
-WORLD_PEAKS = 1
-WORLD_SPREAD = 8.0
+WORLD_PEAKS = 2
+WORLD_SPREAD = 10.0
 
 # Base sprite dimensions (should never change)
-TILE_W_BASE = 128
-TILE_H_BASE = 128
-TILE_Z_BASE = 64
+TILE_W_BASE = 64
+TILE_H_BASE = 64
+TILE_Z_BASE = 32
 
 # Scale factors
 SCALE        = 0.5
@@ -60,9 +50,9 @@ ROCK       = "ROCK"
 # ── Texture Engine config ─────────────────────────────────────────────────────
 
 # Native resolution the collapse runs at — scaled up with nearest-neighbor on blit.
-# smaller = chunkier pixels, faster collapse. 12 is a good GB-feel sweet spot.
-TEX_NATIVE_W = 12
-TEX_NATIVE_H = 8
+# low values will be chunkier details, high for more gritty
+TEX_NATIVE_W = 24
+TEX_NATIVE_H = 24
 
 # 4-color palette — index 0=darkest shadow, 3=lightest catch-light
 PALETTE: list[tuple[int,int,int]] = [
@@ -76,6 +66,54 @@ PALETTE: list[tuple[int,int,int]] = [
 # left/right=flat palette index
 FACE_LEFT_IDX  = 1   # dark face
 FACE_RIGHT_IDX = 0   # darkest face
+
+@dataclass
+class MaterialDef:
+    """
+    Defines the visual personality of a block type.
+    All values tunable independently — no other code needs to change.
+
+    bias        : probability weight per palette index [dark→light].
+                  Does not need to sum to 1.0 — normalised internally.
+    coherence   : 0.0–1.0. How strongly a collapsed cell pulls its
+                  neighbours toward the same colour. High = smooth
+                  blobby patches. Low = noisy, craggy.
+    run_pref    : 0.0–1.0. Tendency to continue the same colour along
+                  a scan row. Produces grain/striations at high values.
+    seed_offset : mixed into the world SEED so each material always
+                  produces a distinct pattern even at the same world seed.
+    """
+    bias:        list[float]
+    coherence:   float
+    run_pref:    float
+    seed_offset: int = 0
+
+MATERIALS: dict[str, MaterialDef] = {
+    GRASS: MaterialDef(
+        bias        = [0.1, 0.1, 0.9, 0.1],
+        coherence   = 0.75,
+        run_pref    = 0.25,
+        seed_offset = 1,
+    ),
+    DIRT: MaterialDef(
+        bias        = [0.1, 0.9, 0.1, 0.1],
+        coherence   = 0.85,
+        run_pref    = 0.25,
+        seed_offset = 2,
+    ),
+    ROCK: MaterialDef(
+        bias        = [0.1, 0.9, 0.1, 0.1],
+        coherence   = 0.20,
+        run_pref    = 0.65,
+        seed_offset = 3,
+    ),
+    REGOLITH: MaterialDef(
+        bias        = [0.1, 0.9, 0.1, 0.1],
+        coherence   = 0.40,
+        run_pref    = 0.72,
+        seed_offset = 4,
+    ),
+}
 
 # ── Inspection Mode config ────────────────────────────────────────────────────
 
@@ -194,74 +232,7 @@ def build_world(seed: int = SEED) -> World:
 
 # ── Texture Engine ────────────────────────────────────────────────────────────
 
-@dataclass
-class MaterialDef:
-    """
-    Defines the visual personality of a block type.
-    All values tunable independently — no other code needs to change.
 
-    bias        : probability weight per palette index [dark→light].
-                  Does not need to sum to 1.0 — normalised internally.
-    coherence   : 0.0–1.0. How strongly a collapsed cell pulls its
-                  neighbours toward the same colour. High = smooth
-                  blobby patches. Low = noisy, craggy.
-    run_pref    : 0.0–1.0. Tendency to continue the same colour along
-                  a scan row. Produces grain/striations at high values.
-    seed_offset : mixed into the world SEED so each material always
-                  produces a distinct pattern even at the same world seed.
-    """
-    bias:        list[float]
-    coherence:   float
-    run_pref:    float
-    seed_offset: int = 0
-
-
-MATERIALS: dict[str, MaterialDef] = {
-
-    # Soft organic patches — living surface texture.
-    # High coherence pools colour into blobs rather than scatter.
-    # Low run_pref keeps it isotropic (no grain direction).
-    # Bias pushes into p2 (light green) with p3 catch-light highlights.
-    GRASS: MaterialDef(
-        bias        = [0.03, 0.12, 0.55, 0.30],
-        coherence   = 0.75,
-        run_pref    = 0.15,
-        seed_offset = 7,
-    ),
-
-    # Compressed, muted, earthy — p3 (highlight) nearly absent.
-    # Mid coherence keeps it quiet. Moderate run_pref gives subtle
-    # horizontal grain — reads as sediment / packed soil.
-    DIRT: MaterialDef(
-        bias        = [0.08, 0.62, 0.28, 0.02],
-        coherence   = 0.55,
-        run_pref    = 0.35,
-        seed_offset = 13,
-    ),
-
-    # Dark, fractured, high contrast — bimodal between p0 and p1.
-    # Very low coherence = craggy, cells rarely clump.
-    # High run_pref = fracture lines run horizontally across the face,
-    # like real rock cleavage. Reads unmistakably as stone.
-    ROCK: MaterialDef(
-        bias        = [0.50, 0.30, 0.15, 0.05],
-        coherence   = 0.20,
-        run_pref    = 0.65,
-        seed_offset = 23,
-    ),
-
-    # Banded strata — geological layering feel.
-    # Bias stays in p1–p2 (mid-tones only), no extremes.
-    # Very high run_pref drives strong horizontal bands that read as
-    # compressed dust / ash / fine sediment layers.
-    REGOLITH: MaterialDef(
-        bias        = [0.10, 0.50, 0.32, 0.08],
-        coherence   = 0.40,
-        run_pref    = 0.72,
-        seed_offset = 37,
-    ),
-
-}
 
 class TextureEngine:
     """
@@ -1227,7 +1198,7 @@ def main() -> None:
     texture_engine = TextureEngine(seed=SEED)
     texture_engine.load()
 
-    camera   = Camera(SCREEN_W, SCREEN_H, move_speed=5.0)
+    camera   = Camera(SCREEN_W, SCREEN_H, move_speed=15.0)
     renderer = Renderer(world, camera, texture_engine)
     picker   = Mouse(world, camera)
 
